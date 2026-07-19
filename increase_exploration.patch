@@ -1,0 +1,32 @@
+# Patch to Increase Exploration and Escape Local Minimum
+
+## Problem
+- Novelty is 0.01 (saturated memory)
+- System stuck generating similar concepts
+- Neuronal memory not pruning
+
+## Solution: 3 Changes
+
+### 1. Increase Mutation Rate (world.py line ~187)
+OLD: new_latent = self.dreamer.mutate_latent(base_latent, mutation_rate=0.15)
+NEW: new_latent = self.dreamer.mutate_latent(base_latent, mutation_rate=0.30)
+
+Effect: Bigger jumps in latent space, more novelty
+
+### 2. Increase Recombination Chance (world.py line ~157)
+OLD: if random.random() < 0.3 and self.memory.index.ntotal > 10:
+NEW: if random.random() < 0.5 and self.memory.index.ntotal > 10:
+
+Effect: 50% recombination (was 30%), more distant fusion
+
+### 3. Trigger Neuronal Maintenance Immediately (world.py line ~140)
+OLD: if self.neuronal_memory.should_run_maintenance():
+NEW: if self.neuronal_memory.should_run_maintenance() or (self.age % 500 == 0):
+
+Effect: Force pruning every 500 generations + when 80% full
+
+### 4. Adjust Novelty Scoring (engines.py line ~42)
+OLD: novelty = min(1.0, avg_dist / 2.0)
+NEW: novelty = min(1.0, avg_dist / 1.0)  # Less harsh penalty
+
+Effect: Higher novelty scores, more acceptance of borderline concepts

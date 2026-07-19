@@ -1,0 +1,47 @@
+# Output directories
+outputs/
+dataset/
+
+# Database
+universe.db
+*.db
+*.db-journal
+
+# FAISS index files
+universe.index
+universe_id_map.json
+
+# Model weights and stats
+gnn_weights.pt
+latent_generator.pt
+latent_generator_stats.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+startup_log.txt
+
+# Scraper files
+sites.txt

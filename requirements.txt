@@ -1,0 +1,10 @@
+torch
+torchvision
+transformers
+diffusers
+faiss-cpu
+networkx
+pygame
+pillow
+numpy
+scikit-learn

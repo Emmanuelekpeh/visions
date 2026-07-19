@@ -45,3 +45,7 @@ startup_log.txt
 
 # Scraper files
 sites.txt
+
+# Documentation files (keep plan.md only)
+*.md
+!plan.md

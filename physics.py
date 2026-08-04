@@ -198,8 +198,9 @@ class PhysicsEngine:
     """
     Observes mutations and extracts the underlying verbs (transformations).
     """
-    def __init__(self, db_conn):
+    def __init__(self, db_conn, db_lock=None):
         self.db_conn = db_conn
+        self.db_lock = db_lock
         self.transformations: Dict[int, TransformationGenome] = {}
         self.similarity_threshold = 0.85 # Cosine similarity needed to match verbs
         self.next_id = 1
@@ -344,6 +345,13 @@ class PhysicsEngine:
         return new_trans
 
     def save_transformation(self, trans: TransformationGenome):
+        if self.db_lock:
+            with self.db_lock:
+                self._save_transformation_impl(trans)
+        else:
+            self._save_transformation_impl(trans)
+    
+    def _save_transformation_impl(self, trans: TransformationGenome):
         cursor = self.db_conn.cursor()
         data = trans.to_dict()
         cursor.execute('''
@@ -372,11 +380,18 @@ class PhysicsEngine:
         self.db_conn.commit()
 
     def load_from_db(self):
+        if self.db_lock:
+            with self.db_lock:
+                self._load_from_db_impl()
+        else:
+            self._load_from_db_impl()
+    
+    def _load_from_db_impl(self):
         cursor = self.db_conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transformations'")
         if not cursor.fetchone():
             return # Table doesn't exist yet
-            
+
         cursor.execute("SELECT * FROM transformations")
         for row in cursor:
             data = {

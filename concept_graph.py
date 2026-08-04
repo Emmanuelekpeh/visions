@@ -444,11 +444,20 @@ class ConceptGraph:
             "avg_reality_distance": np.mean([n.reality_distance for n in self.nodes.values()]) if self.nodes else 0.0
         }
         
-    def save_to_database(self, db_conn):
+    def save_to_database(self, db_conn, db_lock=None):
         """
         Save concept graph metadata to database for persistence.
         """
         import sqlite3
+        import json
+        
+        if db_lock:
+            with db_lock:
+                self._save_to_database_impl(db_conn)
+        else:
+            self._save_to_database_impl(db_conn)
+    
+    def _save_to_database_impl(self, db_conn):
         import json
         
         cursor = db_conn.cursor()
@@ -522,11 +531,20 @@ class ConceptGraph:
               time.time()))
         db_conn.commit()
     
-    def load_from_database(self, db_conn):
+    def load_from_database(self, db_conn, db_lock=None):
         """
         Load existing concepts from database into graph.
         """
         import sqlite3
+        import json
+        
+        if db_lock:
+            with db_lock:
+                self._load_from_database_impl(db_conn)
+        else:
+            self._load_from_database_impl(db_conn)
+    
+    def _load_from_database_impl(self, db_conn):
         import json
         
         cursor = db_conn.cursor()

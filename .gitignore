@@ -1,9 +1,11 @@
 # Output directories
 outputs/
 dataset/
+test_outputs/
 
 # Database
 universe.db
+universe copy.db
 *.db
 *.db-journal
 
@@ -13,8 +15,31 @@ universe_id_map.json
 
 # Model weights and stats
 gnn_weights.pt
+hybrid_mae_weights.pt
+transformation_predictor.pt
 latent_generator.pt
+latent_generator_live.pt
 latent_generator_stats.json
+
+# Test and script files
+test_*.py
+generate_test.py
+fix_generator.py
+compile_video.py
+physics_integration.py
+pixel_critic.py
+pytorch_lock.py
+semantic_training.py
+transformation_predictor.py
+remove_corrupted.py
+mode_library.json
+mode_library.py
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.webp
 
 # Python
 __pycache__/

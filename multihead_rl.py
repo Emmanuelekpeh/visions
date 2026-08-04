@@ -46,9 +46,21 @@ class SharedSignals:
     anti_aesthetic: float = 0.0  # muddy / blurry / sludge
     clip_confidence: float = 0.0  # how decisive CLIP contrast was
 
+    # Pixel CNN + heuristics (decoded image — what CLIP cannot see)
+    pixel_quality: float = 0.5
+    pixel_sludge: float = 0.0
+    pixel_sharpness: float = 0.5
+    pixel_diversity: float = 0.5
+
     # Semantic structure
     tag_peakiness: float = 0.5
     tags: List[str] = field(default_factory=list)
+
+    # Texture regime: counter crystal/sharp attractor bias
+    soft_affinity: float = 0.5       # fluid/organic/smooth tag + low-freq latent
+    crystal_affinity: float = 0.5    # fractal/crystal/geometric tag + high-freq latent
+    texture_balance: float = 0.5     # high = soft-leaning, low = knife/crystal
+    latent_highfreq: float = 0.5     # spatial high-frequency energy in VAE latent
 
     # Latent / representation
     latent_energy: float = 0.5
@@ -81,6 +93,7 @@ def build_shared_signals(
     observer_boost: float = 0.0,
     tags: Optional[List[str]] = None,
     aesthetic_scores: Optional[Dict[str, float]] = None,
+    pixel_scores: Optional[Dict[str, float]] = None,
     **kwargs,
 ) -> SharedSignals:
     """Compute the shared measurement snapshot used by every head."""
@@ -143,6 +156,17 @@ def build_shared_signals(
         signals.anti_aesthetic = _clip01(scored.get("anti", 0.0))
         signals.clip_confidence = _clip01(scored.get("clip_confidence", 0.0))
 
+    # --- Pixel eyes (CNN + heuristics on decoded image) ---
+    if pixel_scores:
+        signals.pixel_quality = _clip01(pixel_scores.get("quality", 0.5))
+        signals.pixel_sludge = _clip01(pixel_scores.get("sludge", 0.0))
+        signals.pixel_sharpness = _clip01(pixel_scores.get("sharpness", 0.5))
+        signals.pixel_diversity = _clip01(pixel_scores.get("diversity", 0.5))
+        # Pixel sludge overrides CLIP when they disagree — CLIP is blind to mush
+        signals.anti_aesthetic = _clip01(
+            max(signals.anti_aesthetic, signals.pixel_sludge * 0.85)
+        )
+
     # --- Semantic peakiness ---
     if vision is not None and hasattr(vision, "tag_confidence_peak") and emb.size > 0:
         signals.tag_peakiness = _clip01(vision.tag_confidence_peak(
@@ -158,23 +182,61 @@ def build_shared_signals(
     signals.latent_energy = _clip01(float(np.sqrt(np.mean(latent_np ** 2))) / 2.0)
     # Channel balance: similar energy across VAE channels ≈ structured, not one-channel noise
     if latent_np.ndim >= 2:
-        flat = latent_np.reshape(latent_np.shape[0], -1) if latent_np.ndim == 4 else latent_np.reshape(-1, latent_np.size)
         # [B,C,H,W] -> per-channel std
         if latent_np.ndim == 4:
             channel_stds = latent_np[0].std(axis=(1, 2))
             mean_std = float(np.mean(channel_stds) + 1e-8)
             balance = 1.0 - float(np.std(channel_stds) / mean_std)
             signals.latent_channel_balance = _clip01(balance)
+            # High-frequency energy: residual after spatial blur
+            vol = latent_np[0]  # [C,H,W]
+            # Cheap box blur via 2x2 mean of non-overlapping blocks then upsample-ish compare
+            c, h, w = vol.shape
+            if h >= 4 and w >= 4:
+                # Average neighboring pixels as low-pass proxy
+                low = vol.copy()
+                low[:, 1:-1, 1:-1] = (
+                    vol[:, :-2, 1:-1] + vol[:, 2:, 1:-1] +
+                    vol[:, 1:-1, :-2] + vol[:, 1:-1, 2:]
+                ) * 0.25
+                high = vol - low
+                signals.latent_highfreq = _clip01(float(np.sqrt(np.mean(high ** 2))) / 1.5)
+            else:
+                signals.latent_highfreq = 0.5
         else:
             signals.latent_channel_balance = _clip01(1.0 / (1.0 + float(np.std(latent_np))))
+            signals.latent_highfreq = 0.5
     else:
         signals.latent_channel_balance = 0.5
+        signals.latent_highfreq = 0.5
 
     signals.embedding_norm = _clip01(float(np.linalg.norm(emb)) / 2.0)
     abs_emb = np.abs(emb) + 1e-8
     abs_emb = abs_emb / abs_emb.sum()
     entropy = -float(np.sum(abs_emb * np.log(abs_emb)))
     signals.embedding_entropy = _clip01(entropy / 6.0)
+
+    # --- Texture regime (soft vs crystal) ---
+    SOFT_TAGS = {
+        "fluid", "organic", "smoke", "cloud", "smooth", "liquid", "peaceful",
+        "landscape", "ocean", "forest", "fire", "gaseous", "plant", "soft",
+    }
+    SHARP_TAGS = {
+        "fractal", "crystal", "geometric", "metallic", "synthetic", "pattern",
+        "machine", "robot", "glass", "symetrical", "solid", "microscopic",
+    }
+    tag_set = {str(t).lower() for t in signals.tags}
+    soft_hits = len(tag_set & SOFT_TAGS)
+    sharp_hits = len(tag_set & SHARP_TAGS)
+    tag_soft = soft_hits / max(1, soft_hits + sharp_hits) if (soft_hits + sharp_hits) else 0.5
+    # Latent: low highfreq → soft
+    latent_soft = 1.0 - signals.latent_highfreq
+    signals.soft_affinity = _clip01(0.55 * tag_soft + 0.45 * latent_soft)
+    signals.crystal_affinity = _clip01(0.55 * (1.0 - tag_soft) + 0.45 * signals.latent_highfreq)
+    # Balance: prefer soft when crystal would otherwise dominate survivors
+    signals.texture_balance = _clip01(
+        0.5 + 0.5 * (signals.soft_affinity - signals.crystal_affinity)
+    )
 
     # --- Lineage ---
     parent_ids = parent_ids or []
@@ -233,8 +295,8 @@ class BeautyHead(RewardHead):
 
     def evaluate(self, concept_embedding, latent, memory, signals: SharedSignals = None, **kwargs) -> float:
         s = signals
-        clip_w = 0.35 + 0.35 * s.clip_confidence  # trust CLIP more when decisive
-        ground_w = 1.0 - 0.25 * s.clip_confidence
+        clip_w = 0.25 + 0.25 * s.clip_confidence  # trust CLIP less — pixels matter more
+        ground_w = 1.0 - 0.15 * s.clip_confidence
 
         facets = {
             "striking": s.aesthetic_striking,
@@ -246,27 +308,36 @@ class BeautyHead(RewardHead):
                 s.reality_affinity * (1.0 - 0.35 * abs(s.reality_distance - 0.85) / 2.0)
             ),
             "clarity": _clip01(s.tag_peakiness * (1.0 - s.anti_aesthetic)),
-            "structure": s.latent_channel_balance,
+            "structure": _clip01(0.5 * s.latent_channel_balance + 0.5 * s.pixel_sharpness),
             "observer": s.observer_boost,
-            "anti_sludge": _clip01(1.0 - s.anti_aesthetic),
+            "anti_sludge": _clip01(1.0 - max(s.anti_aesthetic, s.pixel_sludge)),
+            "pixel_quality": s.pixel_quality,
+            "pixel_sharpness": s.pixel_sharpness,
+            "softness": s.texture_balance,
+            "anti_crystal": _clip01(1.0 - s.crystal_affinity),
         }
         clip_blend = (
-            0.30 * facets["clip_overall"]
-            + 0.20 * facets["striking"]
-            + 0.18 * facets["harmonious"]
-            + 0.16 * facets["vivid"]
-            + 0.16 * facets["composition"]
+            0.22 * facets["clip_overall"]
+            + 0.14 * facets["striking"]
+            + 0.16 * facets["harmonious"]
+            + 0.12 * facets["vivid"]
+            + 0.12 * facets["composition"]
+            + 0.10 * facets["softness"]
         )
         grounded_blend = (
-            0.40 * facets["reality_resonance"]
-            + 0.25 * facets["clarity"]
-            + 0.20 * facets["structure"]
-            + 0.15 * facets["observer"]
+            0.22 * facets["reality_resonance"]
+            + 0.18 * facets["clarity"]
+            + 0.15 * facets["structure"]
+            + 0.10 * facets["observer"]
+            + 0.10 * facets["anti_crystal"]
+            + 0.25 * facets["pixel_quality"]
         )
         # Normalize blend weights
         total_w = clip_w + ground_w
         beauty = (clip_w * clip_blend + ground_w * grounded_blend) / total_w
         beauty *= (0.55 + 0.45 * facets["anti_sludge"])
+        # Soft counterweight: pure crystal knives lose ~20% beauty
+        beauty *= (0.80 + 0.20 * facets["softness"])
         self.last_facets = {k: float(v) for k, v in facets.items()}
         self.last_facets["clip_confidence"] = float(s.clip_confidence)
         return _clip01(beauty)
@@ -285,16 +356,20 @@ class NoveltyHead(RewardHead):
             "grounded": s.grounded_novelty,
             "depart_parents": _clip01(1.0 - s.parent_alignment),
             "under_explored": s.under_explored,
-            "not_sludge": _clip01(1.0 - s.anti_aesthetic),
+            "not_sludge": _clip01(1.0 - max(s.anti_aesthetic, s.pixel_sludge)),
             "tag_fresh": _clip01(1.0 - s.tag_peakiness * 0.5),  # less generic peak
+            "soft_frontier": s.soft_affinity,  # soft regimes are under-explored vs crystal
+            "not_all_crystal": _clip01(1.0 - 0.7 * s.crystal_affinity),
         }
         novelty = (
-            0.30 * facets["geometric"]
-            + 0.25 * facets["grounded"]
-            + 0.15 * facets["depart_parents"]
-            + 0.15 * facets["under_explored"]
-            + 0.10 * facets["not_sludge"]
+            0.25 * facets["geometric"]
+            + 0.20 * facets["grounded"]
+            + 0.12 * facets["depart_parents"]
+            + 0.12 * facets["under_explored"]
+            + 0.08 * facets["not_sludge"]
             + 0.05 * facets["tag_fresh"]
+            + 0.10 * facets["soft_frontier"]
+            + 0.08 * facets["not_all_crystal"]
         )
         self.last_facets = {k: float(v) for k, v in facets.items()}
         return _clip01(novelty)
@@ -541,7 +616,8 @@ class MetaJudge:
             s = self.last_signals
             lines.append(
                 f"  signals: aesthetic={s.aesthetic_overall:.2f} "
-                f"anti={s.anti_aesthetic:.2f} reality={s.reality_distance:.2f} "
+                f"anti={s.anti_aesthetic:.2f} pixel_q={s.pixel_quality:.2f} "
+                f"pixel_sludge={s.pixel_sludge:.2f} reality={s.reality_distance:.2f} "
                 f"observer={s.observer_boost:.2f}"
             )
         return "\n".join(lines)

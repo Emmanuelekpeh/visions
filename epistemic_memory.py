@@ -6,6 +6,7 @@ Core insight: Real ≠ Good. Derived ≠ Bad.
 What matters: How confident are we this concept deserves to exist?
 """
 
+import json
 import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional
@@ -88,7 +89,27 @@ class EpistemicMemory:
         # Promotion thresholds (RELAXED to enable progression)
         self.frontier_survival_generations = 3  # Reduced from 5
         self.promotion_confidence_threshold = 0.50  # Reduced from 0.65
-        
+        # Soft reality leash: widens with universe age (generator learns; don't over-constrain)
+        self.universe_age = 0
+
+    def set_universe_age(self, age: int):
+        self.universe_age = max(0, int(age))
+
+    def reality_leash_limits(self) -> dict:
+        """
+        Light leash that loosens over time.
+        Early: tight. Late: wider dream band, still not free-unmoored.
+        """
+        age = float(self.universe_age)
+        return {
+            # validation far-penalty kicks in above this distance
+            "far_penalty_start": 1.0 + min(0.8, age / 8000.0),
+            # promote if within this distance
+            "promote_max": 1.2 + min(0.8, age / 10000.0),
+            # quarantine if beyond this distance
+            "quarantine_max": 2.0 + min(1.0, age / 8000.0),
+        }
+
     def add_real_image(self, concept_id: int, embedding: np.ndarray) -> ConceptConfidence:
         """Add a real image to landmark memory (immutable, max confidence)."""
         conf = ConceptConfidence(
@@ -201,17 +222,27 @@ class EpistemicMemory:
         # 3. Update confidence based on multiple signals
         validation_bonus = 0.0
         
-        # Moderate prediction error = learning (good!)
-        if 0.1 < prediction_error < 0.4:
+        # Moderate prediction error = learning (good!) — but not for obvious sludge
+        anti_sludge = 0.0
+        if hasattr(self, "_last_anti_sludge"):
+            anti_sludge = float(self._last_anti_sludge)
+        if 0.1 < prediction_error < 0.4 and anti_sludge < 0.45:
             validation_bonus += 0.05  # Sweet spot for learning
         elif prediction_error > 0.6:
             validation_bonus -= 0.05  # Too unpredictable
+        if anti_sludge > 0.52:
+            validation_bonus -= 0.08
+        if hasattr(self, "_last_pixel_sludge") and self._last_pixel_sludge > 0.55:
+            validation_bonus -= 0.10
             
-        # Close to reality = good
+        # Close to reality = good; far = penalty (threshold widens with age)
+        leash = self.reality_leash_limits()
         if reality_dist < 0.3:
             validation_bonus += 0.05
-        elif reality_dist > 1.0:
-            validation_bonus -= 0.1  # Drifted too far
+        elif reality_dist > leash["far_penalty_start"]:
+            # Softer penalty as leash widens
+            overshoot = reality_dist - leash["far_penalty_start"]
+            validation_bonus -= min(0.12, 0.06 + 0.04 * overshoot)
             
         # Stable predictions = trustworthy
         if conf.is_stable():
@@ -233,11 +264,12 @@ class EpistemicMemory:
     def promote_frontier_concepts(self):
         """Promote frontier concepts that proved themselves to working memory."""
         promoted = []
-        
+        promote_max = self.reality_leash_limits()["promote_max"]
+
         for c_id, conf in list(self.frontier_concepts.items()):
             if (conf.promotion_eligible and 
                 conf.confidence > self.promotion_confidence_threshold and
-                conf.reality_distance < 1.2):  # Increased from 0.8 to allow more distant concepts
+                conf.reality_distance < promote_max):
                 
                 # Promote to working memory
                 conf.tier = MemoryTier.WORKING
@@ -252,10 +284,11 @@ class EpistemicMemory:
         Quarantine frontier concepts that drifted too far or have low confidence.
         """
         quarantined = []
-        
+        quarantine_max = self.reality_leash_limits()["quarantine_max"]
+
         for c_id, conf in list(self.frontier_concepts.items()):
-            # Danger signals (RELAXED to prevent over-quarantine)
-            too_far = conf.reality_distance > 2.0  # Increased from 1.5
+            # Danger signals (RELAXED; leash widens with age)
+            too_far = conf.reality_distance > quarantine_max
             too_uncertain = conf.confidence < 0.20  # Reduced from 0.25
             unstable = len(conf.prediction_errors) > 10 and not conf.is_stable()  # Increased from 5
             
@@ -324,11 +357,18 @@ class EpistemicMemory:
         # If frontier is large, we need to validate what we have
         return frontier_ratio < 0.3
         
-    def save_to_database(self, db_conn):
+    def save_to_database(self, db_conn, db_lock=None):
         """Save epistemic memory state to database."""
         import sqlite3
         import json
         
+        if db_lock:
+            with db_lock:
+                self._save_to_database_impl(db_conn)
+        else:
+            self._save_to_database_impl(db_conn)
+    
+    def _save_to_database_impl(self, db_conn):
         cursor = db_conn.cursor()
         
         print("Saving epistemic memory state...")
@@ -367,7 +407,7 @@ class EpistemicMemory:
         db_conn.commit()
         print(f"Saved epistemic state for {saved_count} concepts")
     
-    def load_from_database(self, db_conn):
+    def load_from_database(self, db_conn, db_lock=None):
         """
         Load existing concepts from database into epistemic memory.
         
@@ -378,12 +418,21 @@ class EpistemicMemory:
         import sqlite3
         import json
         
-        cursor = db_conn.cursor()
+        if db_lock:
+            with db_lock:
+                self._load_from_database_impl(db_conn)
+        else:
+            self._load_from_database_impl(db_conn)
+    
+    def _load_from_database_impl(self, db_conn):
+        import json
         
+        cursor = db_conn.cursor()
+
         # Get real image IDs
         cursor.execute("SELECT concept_id FROM ingested_files")
         real_image_ids = {row[0] for row in cursor}
-        
+
         # Load all concepts
         cursor.execute("SELECT id, embedding FROM concepts")
         

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from concept_graph import ConceptGraph, ConceptNode, EdgeType, NodeTier
+from training_scheduler import run_on_pytorch_thread
 
 class GraphConvLayer(nn.Module):
     """
@@ -80,7 +81,7 @@ class ConceptGNN(nn.Module):
         
         # Graph convolution layers
         self.conv_layers = nn.ModuleList([
-            GraphConvLayer(hidden_dim, hidden_dim, num_edge_types=5)
+            GraphConvLayer(hidden_dim, hidden_dim, num_edge_types=6)
             for _ in range(num_layers)
         ])
         
@@ -269,7 +270,8 @@ class GraphReasoningSystem:
             EdgeType.VISUAL_SIMILAR,
             EdgeType.COMBINES_WITH,
             EdgeType.CONTRADICTS,
-            EdgeType.SPECIALIZES_INTO
+            EdgeType.SPECIALIZES_INTO,
+            EdgeType.FAILED_INVALID  # Represents all hazard edges combined
         ]
         
         adj_matrices = []
@@ -313,6 +315,14 @@ class GraphReasoningSystem:
                             tgt_idx = id_to_idx[other_id]
                             adj[src_idx, tgt_idx] = 1.0
                             
+                # Hazard Map Edges (New 6th adjacency matrix)
+                elif edge_type == EdgeType.FAILED_INVALID:
+                    # Treat all hazard types as a single negative adjacency for the GNN
+                    for other_id in node.failed_invalid + node.failed_unstable + node.failed_sterile + node.failed_catastrophic:
+                        if other_id in id_to_idx:
+                            tgt_idx = id_to_idx[other_id]
+                            adj[src_idx, tgt_idx] = 1.0
+                            
             adj_matrices.append(adj)
             
         return node_features, adj_matrices, id_to_idx
@@ -328,19 +338,22 @@ class GraphReasoningSystem:
         if len(self.graph.nodes) == 0:
             return []
             
-        # Build graph (CPU-safe subsample on large graphs)
+        return run_on_pytorch_thread(self._recommend_parents_for_mutation_impl, k, current_time)
+
+    def _recommend_parents_for_mutation_impl(self, k: int, current_time: float) -> List[Tuple[int, float, float, float]]:
         node_features, adj_matrices, id_to_idx = self._build_adjacency_matrices(max_nodes=256)
-        
         if len(node_features) == 0:
             return []
-        
-        # Forward pass
+
         with torch.no_grad():
             node_reps = self.gnn(node_features, adj_matrices)
-            
-            # Predict offspring quality AND uncertainty for all nodes
             all_indices = list(range(len(node_features)))
             qualities, uncertainties = self.gnn.predict_offspring_quality(node_reps, all_indices)
+            qualities = qualities.detach().cpu().tolist()
+            uncertainties = uncertainties.detach().cpu().tolist()
+            
+            exploration_vals = self.gnn.predict_exploration_value(node_reps, all_indices)
+            exploration_vals = exploration_vals.detach().cpu().tolist()
             
         # Map back to node IDs and compute exploration bonuses
         # Snapshot to avoid race conditions
@@ -348,7 +361,7 @@ class GraphReasoningSystem:
         recommendations = []
         
         for idx in range(len(node_ids)):
-            if idx >= len(qualities):
+            if idx >= len(qualities) or idx >= len(exploration_vals):
                 break # safeguard against dimension mismatch during active async ingestion
             node_id = node_ids[idx]
             
@@ -360,7 +373,7 @@ class GraphReasoningSystem:
             
             quality = float(qualities[idx])
             uncertainty = float(uncertainties[idx])
-            exploration = node.exploration_bonus(current_time)
+            exploration = float(exploration_vals[idx])
             
             # Combined score:
             # high reward + low uncertainty = exploit
@@ -388,16 +401,15 @@ class GraphReasoningSystem:
         if len(self.graph.nodes) < 2:
             return []
             
-        # Build graph (CPU-safe subsample)
+        return run_on_pytorch_thread(self._recommend_parent_pairs_impl, k, current_time)
+
+    def _recommend_parent_pairs_impl(self, k: int, current_time: float) -> List[Tuple[int, int, float, float]]:
         node_features, adj_matrices, id_to_idx = self._build_adjacency_matrices(max_nodes=256)
-        
         if len(node_features) == 0:
             return []
-            
-        # Snapshot from the (possibly subsampled) index map
+
         node_ids = list(id_to_idx.keys())
-        
-        # Sample candidate pairs (can't try all N^2 pairs)
+
         import random
         candidate_pairs = []
         for _ in range(min(100, max(1, len(node_ids) * len(node_ids) // 10))):
@@ -406,21 +418,23 @@ class GraphReasoningSystem:
             a, b = random.sample(node_ids, 2)
             if a in id_to_idx and b in id_to_idx:
                 candidate_pairs.append((a, b))
-            
+
         if not candidate_pairs:
             return []
-            
-        # Forward pass
+
         with torch.no_grad():
             node_reps = self.gnn(node_features, adj_matrices)
-            
-            # Predict combination success AND uncertainty (all pairs are already validated)
             parent_a_indices = [id_to_idx[a] for a, b in candidate_pairs]
             parent_b_indices = [id_to_idx[b] for a, b in candidate_pairs]
-            
             success_scores, uncertainties = self.gnn.predict_combination_success(
                 node_reps, parent_a_indices, parent_b_indices
             )
+            success_scores = success_scores.detach().cpu().tolist()
+            uncertainties = uncertainties.detach().cpu().tolist()
+            
+            all_indices = list(range(len(node_features)))
+            exploration_vals = self.gnn.predict_exploration_value(node_reps, all_indices)
+            exploration_vals = exploration_vals.detach().cpu().tolist()
             
         # Combine results with exploration bonus
         recommendations = []
@@ -433,10 +447,8 @@ class GraphReasoningSystem:
             uncertainty = float(uncertainties[i])
             
             # Exploration bonuses for both parents
-            node_a = self.graph.nodes[a]
-            node_b = self.graph.nodes[b]
-            exploration_a = node_a.exploration_bonus(current_time)
-            exploration_b = node_b.exploration_bonus(current_time)
+            exploration_a = float(exploration_vals[id_to_idx[a]]) if a in id_to_idx else 0.0
+            exploration_b = float(exploration_vals[id_to_idx[b]]) if b in id_to_idx else 0.0
             avg_exploration = (exploration_a + exploration_b) / 2.0
             
             # Combined score
@@ -452,6 +464,36 @@ class GraphReasoningSystem:
         
         return recommendations[:k]
         
+    def get_exploration_values(self, node_ids: List[int]) -> Dict[int, float]:
+        """Get GNN predicted exploration values for specific nodes."""
+        if not node_ids:
+            return {}
+        return run_on_pytorch_thread(self._get_exploration_values_impl, node_ids)
+
+    def _get_exploration_values_impl(self, node_ids: List[int]) -> Dict[int, float]:
+        node_features, adj_matrices, id_to_idx = self._build_adjacency_matrices(max_nodes=256)
+        if len(node_features) == 0:
+            return {nid: 0.0 for nid in node_ids}
+            
+        with torch.no_grad():
+            node_reps = self.gnn(node_features, adj_matrices)
+            all_indices = list(range(len(node_features)))
+            exploration_values = self.gnn.predict_exploration_value(node_reps, all_indices)
+            exploration_values = exploration_values.detach().cpu().tolist()
+            
+        result = {}
+        for nid in node_ids:
+            if nid in id_to_idx:
+                idx = id_to_idx[nid]
+                if idx < len(exploration_values):
+                    result[nid] = float(exploration_values[idx])
+                else:
+                    result[nid] = 0.0
+            else:
+                result[nid] = 0.0
+                
+        return result
+
     def train_step(self, max_nodes: int = 256):
         """
         Train the GNN on accumulated data.
@@ -464,8 +506,10 @@ class GraphReasoningSystem:
         if len(self.training_buffer["offspring_quality"]) < 10:
             return 0.0  # Not enough data yet
 
+        return run_on_pytorch_thread(self._train_step_impl, max_nodes)
+
+    def _train_step_impl(self, max_nodes: int = 256):
         try:
-            # Build graph (optionally subsampled for memory safety)
             node_features, adj_matrices, id_to_idx = self._build_adjacency_matrices(
                 max_nodes=max_nodes
             )
@@ -473,7 +517,6 @@ class GraphReasoningSystem:
             if len(node_features) == 0:
                 return 0.0
 
-            # Forward pass
             node_reps = self.gnn(node_features, adj_matrices)
 
             # Loss 1: Offspring quality prediction
@@ -549,8 +592,7 @@ class GraphReasoningSystem:
                 loss_value = float(total_loss.detach().item())
                 del node_features, adj_matrices, node_reps, total_loss
                 return loss_value
-            else:
-                return 0.0
+            return 0.0
         except Exception as e:
             # Never let GNN training take down the universe process
             print(f"[GNN] train_step failed (continuing evolution): {e}")

@@ -83,12 +83,31 @@ class MetaController:
             novelty_trend = 0.0
             
         # 2. Memory saturation
-        total_concepts = len(memory_system.neurons) if hasattr(memory_system, 'neurons') else 1000
-        max_concepts = getattr(memory_system, 'max_concepts', 5000)
+        if hasattr(memory_system, 'landmark_concepts'):
+            total_concepts = len(memory_system.landmark_concepts) + len(memory_system.working_concepts) + len(memory_system.frontier_concepts)
+            max_concepts = 5000 # Default max
+        elif hasattr(memory_system, 'neurons'):
+            total_concepts = len(memory_system.neurons)
+            max_concepts = getattr(memory_system, 'max_concepts', 5000)
+        else:
+            total_concepts = 1000
+            max_concepts = 5000
         memory_saturation = total_concepts / max_concepts
         
         # 3. Average concept age
-        if hasattr(memory_system, 'neurons'):
+        if hasattr(memory_system, 'landmark_concepts'):
+            import time
+            current_time = time.time()
+            ages = []
+            for conf in memory_system.landmark_concepts.values():
+                ages.append(current_time - conf.creation_time)
+            for conf in memory_system.working_concepts.values():
+                ages.append(current_time - conf.creation_time)
+            for conf in memory_system.frontier_concepts.values():
+                ages.append(current_time - conf.creation_time)
+            # Convert time age to approximate generation age (assuming ~1 gen / sec)
+            avg_age = np.mean(ages) if ages else 0.0
+        elif hasattr(memory_system, 'neurons'):
             ages = [n.age for n in memory_system.neurons.values()]
             avg_age = np.mean(ages) if ages else 0.0
         else:
@@ -98,8 +117,11 @@ class MetaController:
         # Would track concept selection history in production
         replay_frequency = 0.3  # Placeholder
         
-        # 5. Reconstruction loss (placeholder - would track decode quality)
-        reconstruction_loss = 0.2  # Placeholder
+        # 5. Reconstruction loss (track decode quality)
+        if hasattr(rl_system, 'last_signals') and rl_system.last_signals is not None:
+            reconstruction_loss = 1.0 - rl_system.last_signals.pixel_quality
+        else:
+            reconstruction_loss = 0.2  # Fallback
         
         # 6. Embedding entropy
         if len(self.entropy_history) > 0:
@@ -184,7 +206,11 @@ class MetaController:
                 
         # RULE 5: High Prediction Error → Boost Curiosity (Learning Phase)
         if state.prediction_error_trend > 0.3:  # Lots of surprises = learning
-            print("[MetaController] High learning signal - boosting Curiosity")
+            if not hasattr(self, "_curiosity_print_counter"):
+                self._curiosity_print_counter = 0
+            self._curiosity_print_counter += 1
+            if self._curiosity_print_counter % 25 == 0:
+                print("[MetaController] High learning signal - boosting Curiosity")
             weights["Curiosity"] += 0.15
             weights["Novelty"] += 0.10
             

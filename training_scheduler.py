@@ -1,19 +1,15 @@
 """
-Thread-Safe Training Scheduler
+Thread-Safe PyTorch Executor
 
-Solves C++ Access Violation in PyTorch's Adam optimizer by ensuring all
-PyTorch training operations happen on a single dedicated thread.
-
-Problem:
-    - PyTorch's C++ backend is NOT thread-safe
-    - Adam optimizer maintains momentum buffers in C++ memory
-    - Python locks (RLock) don't protect C++ memory allocator operations
-    - Multiple threads calling optimizer.step() → C++ race condition → Access Violation
+PyTorch's C++ backend is NOT thread-safe on CPU (especially Windows).
+Python RLock does NOT protect the C++ memory allocator — concurrent
+inference (VAE/CLIP on evolve thread) + training (Adam on worker thread)
+still causes access violations even with a lock.
 
 Solution:
-    - Single dedicated training thread with a queue
-    - All training requests are serialized through this thread
-    - PyTorch operations never overlap at C++ level
+    - ONE dedicated worker thread owns ALL PyTorch operations
+    - Inference AND training are queued and executed sequentially
+    - Other threads block on submit(wait=True) until their task completes
 """
 
 import threading
@@ -21,119 +17,197 @@ import queue
 from typing import Callable, Any, Optional
 from dataclasses import dataclass
 import traceback
-
+import torch
+import torch.nn.functional as F
+import time
+import random
+from engines import load_image
 
 @dataclass
 class TrainingTask:
-    """A training task to be executed on the training thread."""
+    """A PyTorch task to be executed on the dedicated worker thread."""
     func: Callable
     args: tuple
     kwargs: dict
     result_queue: Optional[queue.Queue] = None
 
 
+class OnlineTrainer:
+    """
+    Handles continuous online training of the Hybrid MAE model.
+    Runs in the background, sampling images from the database and updating the model.
+    """
+    def __init__(self, model, memory, device="cpu", save_path="hybrid_mae_weights.pt"):
+        self.model = model
+        self.memory = memory
+        self.device = device
+        self.save_path = save_path
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=0.05)
+        self.running = False
+        self.thread = None
+        self.loss_history = []
+        self.steps = 0
+        
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._training_loop, daemon=True, name="OnlineTrainer")
+        self.thread.start()
+        print("[OnlineTrainer] Started continuous background training")
+        
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=5.0)
+        self._save_model()
+        print("[OnlineTrainer] Stopped and saved model.")
+            
+    def _save_model(self):
+        try:
+            torch.save(self.model.state_dict(), self.save_path)
+        except Exception as e:
+            print(f"[OnlineTrainer] Failed to save model: {e}")
+
+    def _training_loop(self):
+        while self.running:
+            try:
+                # Need at least a few images to train
+                living_ids = list(self.memory.get_living_ids())
+                if len(living_ids) < 10:
+                    time.sleep(5.0)
+                    continue
+                    
+                # Sample a batch (batch size 4 for CPU)
+                batch_ids = random.sample(living_ids, min(4, len(living_ids)))
+                batch_imgs = []
+                
+                for cid in batch_ids:
+                    path = self.memory.get_image_path_for_concept(cid)
+                    if path:
+                        try:
+                            img = load_image(path)
+                            batch_imgs.append(img)
+                        except Exception:
+                            pass
+                            
+                if not batch_imgs:
+                    time.sleep(1.0)
+                    continue
+                    
+                # Stack into batch
+                batch = torch.cat(batch_imgs, dim=0).to(self.device)
+                
+                # Train step (must run on PyTorch thread to avoid C++ backend crashes)
+                loss = run_on_pytorch_thread(self._train_step, batch)
+                
+                if loss is not None:
+                    self.loss_history.append(loss)
+                    if len(self.loss_history) > 100:
+                        self.loss_history.pop(0)
+                        
+                    self.steps += 1
+                    # Save the model periodically (every 50 steps)
+                    if self.steps % 50 == 0:
+                        run_on_pytorch_thread(self._save_model)
+                        
+                # Sleep to yield CPU to the main evolutionary loop
+                time.sleep(2.0)
+                
+            except Exception as e:
+                print(f"[OnlineTrainer] Error: {e}")
+                time.sleep(5.0)
+                
+    def _train_step(self, batch):
+        self.model.train()
+        self.optimizer.zero_grad()
+        
+        # Forward pass (MAE objective)
+        pred, mask = self.model(batch, mask_ratio=0.75)
+        
+        # Compute loss only on masked patches
+        # pred: (B, C, H, W), batch: (B, C, H, W)
+        loss = F.mse_loss(pred, batch, reduction='none')
+        # We need to reshape mask to match spatial dimensions, or just use simple MSE for now
+        loss = loss.mean()
+        
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+        
+    def get_recent_loss(self):
+        if not self.loss_history:
+            return 0.0
+        return sum(self.loss_history[-10:]) / min(10, len(self.loss_history))
+
+
 class TrainingScheduler:
     """
-    Single-threaded training scheduler that ensures all PyTorch operations
-    happen on one dedicated thread, preventing C++ race conditions.
+    Single-threaded PyTorch executor.
+    ALL torch operations (inference, training, optimizers) run here.
     """
-    
+
     def __init__(self):
-        self.task_queue = queue.Queue(maxsize=100)
+        self.task_queue = queue.Queue(maxsize=200)
         self.shutdown_flag = threading.Event()
         self.worker_thread = None
         self._start_worker()
-    
+
     def _start_worker(self):
-        """Start the dedicated training worker thread."""
         self.worker_thread = threading.Thread(
             target=self._worker_loop,
             daemon=True,
-            name="PyTorchTrainingWorker"
+            name="PyTorchWorker",
         )
         self.worker_thread.start()
-    
+
     def _worker_loop(self):
-        """
-        Main loop for the training worker thread.
-        All PyTorch training operations execute here sequentially.
-        """
         while not self.shutdown_flag.is_set():
             try:
-                # Wait for next task with timeout to check shutdown flag
                 task = self.task_queue.get(timeout=0.1)
-                
                 try:
-                    # Execute the training task
                     result = task.func(*task.args, **task.kwargs)
-                    
-                    # Return result if requested
                     if task.result_queue is not None:
                         task.result_queue.put(("success", result))
-                        
                 except Exception as e:
-                    # Capture exception and return to caller
-                    error_msg = f"Training task failed: {e}\n{traceback.format_exc()}"
-                    print(f"[TrainingScheduler] {error_msg}")
-                    
+                    error_msg = f"PyTorch task failed: {e}\n{traceback.format_exc()}"
+                    print(f"[PyTorchWorker] {error_msg}")
                     if task.result_queue is not None:
                         task.result_queue.put(("error", error_msg))
-                
                 finally:
                     self.task_queue.task_done()
-                    
             except queue.Empty:
-                # No tasks, continue checking shutdown flag
                 continue
-    
-    def submit(self, func: Callable, *args, wait: bool = False, **kwargs) -> Any:
-        """
-        Submit a training task to the scheduler.
-        
-        Args:
-            func: Function to execute (e.g., latent_generator_trainer.train_on_batch)
-            *args: Positional arguments for func
-            wait: If True, block until task completes and return result
-            **kwargs: Keyword arguments for func
-        
-        Returns:
-            If wait=True: Result from func
-            If wait=False: None
-        
-        Raises:
-            RuntimeError: If scheduler is shutdown
-            Exception: If wait=True and func raises an exception
-        """
+
+    def submit(
+        self,
+        func: Callable,
+        *args,
+        wait: bool = False,
+        timeout: float = 120.0,
+        **kwargs,
+    ) -> Any:
         if self.shutdown_flag.is_set():
-            raise RuntimeError("TrainingScheduler is shutdown")
-        
-        # Create result queue if caller wants to wait
+            raise RuntimeError("PyTorch executor is shutdown")
+
         result_queue = queue.Queue(maxsize=1) if wait else None
-        
-        # Create and submit task
-        task = TrainingTask(
-            func=func,
-            args=args,
-            kwargs=kwargs,
-            result_queue=result_queue
-        )
-        
+        task = TrainingTask(func=func, args=args, kwargs=kwargs, result_queue=result_queue)
+
         try:
-            self.task_queue.put(task, timeout=5.0)
+            self.task_queue.put(task, timeout=10.0)
         except queue.Full:
-            raise RuntimeError("Training queue is full - system is overloaded")
-        
-        # Wait for result if requested
+            raise RuntimeError("PyTorch queue is full - system is overloaded")
+
         if wait:
             try:
-                status, result = result_queue.get(timeout=30.0)
+                status, result = result_queue.get(timeout=timeout)
                 if status == "success":
                     return result
-                else:
-                    raise RuntimeError(result)
+                raise RuntimeError(result)
             except queue.Empty:
-                raise TimeoutError("Training task timed out after 30 seconds")
-        
+                raise TimeoutError(f"PyTorch task timed out after {timeout} seconds")
+
         return None
     
     def shutdown(self, timeout: float = 5.0):
@@ -176,19 +250,36 @@ _scheduler_lock = threading.Lock()
 
 
 def get_training_scheduler() -> TrainingScheduler:
-    """
-    Get the global training scheduler singleton.
-    Thread-safe lazy initialization.
-    """
+    """Get the global PyTorch executor singleton."""
     global _global_scheduler
-    
+
     if _global_scheduler is None:
         with _scheduler_lock:
             if _global_scheduler is None:
                 _global_scheduler = TrainingScheduler()
-                print("[TrainingScheduler] Initialized global training scheduler")
-    
+                print("[PyTorchWorker] Initialized single-threaded PyTorch executor")
+
     return _global_scheduler
+
+
+def is_pytorch_worker_thread() -> bool:
+    """True if the current thread is the dedicated PyTorch worker."""
+    if _global_scheduler is None:
+        return False
+    worker = _global_scheduler.worker_thread
+    return worker is not None and threading.current_thread() is worker
+
+
+def run_on_pytorch_thread(func: Callable, *args, wait: bool = True, **kwargs) -> Any:
+    """
+    Run a callable on the PyTorch worker thread.
+
+    If already on the worker thread, runs inline (avoids deadlock).
+    Otherwise queues the task; blocks until done when wait=True.
+    """
+    if is_pytorch_worker_thread():
+        return func(*args, **kwargs)
+    return get_training_scheduler().submit(func, *args, wait=wait, **kwargs)
 
 
 def shutdown_training_scheduler():

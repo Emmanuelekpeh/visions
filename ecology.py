@@ -233,8 +233,9 @@ class Ecologist:
     Discovers and tracks species.
     Uses Louvain clustering as a detector, but enforces ancestry and verb constraints.
     """
-    def __init__(self, db_conn):
+    def __init__(self, db_conn, db_lock=None):
         self.db_conn = db_conn
+        self.db_lock = db_lock
         self.species: Dict[int, Species] = {}
         self.legends: Dict[int, LegendNode] = {}
         self.node_to_species: Dict[int, int] = {} # concept_id -> species_id
@@ -244,6 +245,13 @@ class Ecologist:
         self.load_from_db()
 
     def _init_db(self):
+        if self.db_lock:
+            with self.db_lock:
+                self._init_db_impl()
+        else:
+            self._init_db_impl()
+    
+    def _init_db_impl(self):
         cursor = self.db_conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ecology_species (
@@ -270,8 +278,9 @@ class Ecologist:
         
         # 1. Graph Cohesion (Build undirected graph for Louvain)
         G = nx.Graph()
+        from concept_graph import NodeTier
         for node_id, node in concept_graph.nodes.items():
-            if node.tier == "reality": continue # Reality nodes don't form species
+            if node.tier == NodeTier.REALITY: continue # Reality nodes don't form species
             G.add_node(node_id)
             for parent_id in node.parents:
                 if parent_id in concept_graph.nodes:
@@ -309,8 +318,30 @@ class Ecologist:
             # Find the oldest node in the cluster
             oldest_node = min(members, key=lambda x: concept_graph.nodes[x].age if x in concept_graph.nodes else float('inf'))
             
-            # Check if a majority of members trace back to this node (simplified check: are they connected?)
-            # In a full implementation, we'd do a directed reachability check.
+            # Check if a majority of members trace back to this node (directed reachability check)
+            reachable_count = 0
+            for member_id in members:
+                if member_id == oldest_node:
+                    reachable_count += 1
+                    continue
+                # Simple BFS up the parent chain
+                visited = set()
+                queue = [member_id]
+                found = False
+                while queue:
+                    curr = queue.pop(0)
+                    if curr == oldest_node:
+                        found = True
+                        break
+                    if curr not in visited and curr in concept_graph.nodes:
+                        visited.add(curr)
+                        queue.extend(concept_graph.nodes[curr].parents)
+                if found:
+                    reachable_count += 1
+            
+            # If less than 30% of members share this ancestry, it's not a cohesive species
+            if reachable_count / len(members) < 0.3:
+                continue
             
             # 3. Shared Verb Check
             # Collect verbs used to create these members
@@ -438,9 +469,15 @@ class Ecologist:
                             lat = concept_graph.nodes[m].latent
                             if lat is None:
                                 # Fetch latent from database if not loaded
-                                cursor = self.db_conn.cursor()
-                                cursor.execute("SELECT latent FROM concepts WHERE id = ?", (m,))
-                                row = cursor.fetchone()
+                                if self.db_lock:
+                                    with self.db_lock:
+                                        cursor = self.db_conn.cursor()
+                                        cursor.execute("SELECT latent FROM concepts WHERE id = ?", (m,))
+                                        row = cursor.fetchone()
+                                else:
+                                    cursor = self.db_conn.cursor()
+                                    cursor.execute("SELECT latent FROM concepts WHERE id = ?", (m,))
+                                    row = cursor.fetchone()
                                 if row and row[0]:
                                     lat = np.array(json.loads(row[0]), dtype=np.float32)
                                     concept_graph.nodes[m].latent = lat
@@ -471,6 +508,13 @@ class Ecologist:
                 self.save_species(s)
 
     def save_species(self, s: Species):
+        if self.db_lock:
+            with self.db_lock:
+                self._save_species_impl(s)
+        else:
+            self._save_species_impl(s)
+    
+    def _save_species_impl(self, s: Species):
         cursor = self.db_conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO ecology_species (id, data)
@@ -479,6 +523,13 @@ class Ecologist:
         self.db_conn.commit()
 
     def save_legend(self, l: LegendNode):
+        if self.db_lock:
+            with self.db_lock:
+                self._save_legend_impl(l)
+        else:
+            self._save_legend_impl(l)
+    
+    def _save_legend_impl(self, l: LegendNode):
         cursor = self.db_conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO ecology_legends (id, data)
@@ -487,11 +538,18 @@ class Ecologist:
         self.db_conn.commit()
 
     def load_from_db(self):
+        if self.db_lock:
+            with self.db_lock:
+                self._load_from_db_impl()
+        else:
+            self._load_from_db_impl()
+    
+    def _load_from_db_impl(self):
         cursor = self.db_conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ecology_species'")
         if not cursor.fetchone():
             return
-            
+
         cursor.execute("SELECT data FROM ecology_species")
         for row in cursor:
             data = json.loads(row[0])
